@@ -1,4 +1,4 @@
-## 🚢 Host-ship 自动续期（GitHub Actions，纯 HTTP 单账号版）
+## 🚢 Host-ship 自动续期 + 状态巡检（GitHub Actions，纯 HTTP 单账号版）
 
 ### 🔐 Secrets 配置说明
 
@@ -11,6 +11,31 @@
 | TG_BOT_TOKEN  | ❌ 可选  | Telegram Bot Token |
 | TG_CHAT_ID    | ❌ 可选  | Telegram Chat ID |
 
+### 🔁 每次运行做什么
+
+1. **读快照**：`GET /api/client/servers/{uuid}` → `name` / `renewal`（剩余天数）/ `renewable` / `renewal_cooldown` / `renewal_locked`
+2. **查运行状态**：`GET /api/client/servers/{uuid}/resources` → `current_state`（`running` / `offline` …）+ `is_suspended`
+   - 面板详情接口的 `status` 字段是空的，**运行态只能从这里拿**，日志里打印的就是它
+3. **续期循环**：只要没到 30 天上限、后端允许（`renewable` / `renewal_locked` / `renewal_cooldown` 门控通过），就反复 `POST /renew`，
+   每次之间等待 `RENEW_INTERVAL`（默认 65s，面板要求间隔 ≥1 分钟），直到**续满 30 天**或不可续；单次运行最多 `MAX_RENEW_ROUNDS`（默认 6）次
+4. **开机**：若 `current_state == offline`，发 `POST /api/client/servers/{uuid}/power` `{"signal":"start"}`，等 `POWER_WAIT` 秒后复查状态
+5. **通知**：Telegram 一条汇总（续期次数、续期前后到期时间、运行状态变化、开机结果）
+
+> 续期与开机是两件事：面板不会因为续期成功就自动开机，所以脚本在续期后补了一次 start。
+> 免费机规则：每次续期最多 +10 天、累计上限 30 天（满了按钮不可点）；只要剩余天数 > 0 服务器就能开机。
+
+### ⚙️ 可调环境变量（一般不用设）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BASE_URL` | `https://panel.host-ship.com` | 面板地址（本地联调时可指向 mock） |
+| `RENEW_INTERVAL` | `65` | 两次续期之间的等待秒数 |
+| `POWER_WAIT` | `15` | 发出 start 后等待复查状态的秒数 |
+
+### 🧪 退出码
+
+- `0`：续期成功 / 无需续期（开机失败也会打印明确提示）
+- `1`：续期失败（Actions 会标红）
 
 ## ⚠️ 免责声明
 
