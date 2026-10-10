@@ -17,7 +17,9 @@ TIMEOUT = 20
 MAX_RENEWAL_DAYS = 30   # 面板续期上限：续满 30 天后按钮不可点
 RENEW_INTERVAL   = int(os.environ.get("RENEW_INTERVAL") or 65)  # 两次续期间隔（面板要求 ≥1 分钟，留 5s 余量）
 MAX_RENEW_ROUNDS = 6    # 单次运行最多续期几次（安全阀；正常 3 次即可满 30 天）
-POWER_WAIT       = int(os.environ.get("POWER_WAIT") or 15)     # 发出 start 后等待几秒再复查状态
+POWER_WAIT       = int(os.environ.get("POWER_WAIT") or 10)      # 发出 start 后首次等待秒数
+POWER_POLL_TOTAL = int(os.environ.get("POWER_POLL_TOTAL") or 120)  # 确认开机的最长轮询时间
+POWER_POLL_EVERY = int(os.environ.get("POWER_POLL_EVERY") or 10)   # 轮询间隔
 
 def mask(s: str, head: int = 6, tail: int = 4) -> str:
     s = s or ""
@@ -451,14 +453,22 @@ def main():
             elif COOKIE_RAW:
                 ok, info = cookie_power("start")
             if ok:
-                print(f"⏳ 已发送 start，等待 {POWER_WAIT}s 复查状态 ...")
-                time.sleep(POWER_WAIT)
-                state_after, raw_after = fetch_state()
-                if (raw_after or "").strip().lower() in ("running", "starting"):
-                    boot_note = f"已启动（{state_before} → {state_after}）"
-                    print(f"✅ 开机完成: {boot_note}")
+                print(f"⏳ 已发送 start，开始轮询状态（每 {POWER_POLL_EVERY}s 一次，"
+                      f"最多 {POWER_POLL_TOTAL}s）...")
+                waited = 0
+                while waited < POWER_POLL_TOTAL:
+                    step = POWER_WAIT if waited == 0 else POWER_POLL_EVERY
+                    time.sleep(step)
+                    waited += step
+                    state_after, raw_after = fetch_state()
+                    if (raw_after or "").strip().lower() in ("running", "starting"):
+                        boot_note = f"已启动（{state_before} → {state_after}，{waited}s 后确认）"
+                        print(f"✅ 开机完成: {boot_note}")
+                        break
+                    print(f"   …已等 {waited}s：{state_after}")
                 else:
-                    boot_note = f"已发送 start，但状态仍为「{state_after}」，请人工确认"
+                    boot_note = (f"已发送 start（HTTP 204），但 {POWER_POLL_TOTAL}s 内面板状态仍为"
+                                 f"「{state_after}」；可能是状态上报延迟，请稍后自行确认")
                     print(f"⚠️ {boot_note}")
             else:
                 boot_note = f"开机失败: {info[:120]}"
