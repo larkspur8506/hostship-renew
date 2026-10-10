@@ -51,7 +51,8 @@ def state_text(state, suspended=False) -> str:
     if suspended:
         return "已暂停（suspended）"
     key = (state or "").strip().lower()
-    return {"running": "运行中", "starting": "启动中", "stopping": "停止中",
+    # 面板会把刚开机的服务器报成 starting；对用户来说这就是"运行中"
+    return {"running": "运行中", "starting": "运行中", "stopping": "停止中",
             "offline": "已停机"}.get(key, state or "（未知）")
 
 def format_notification(status: str, server_name: str = "", old: str = "",
@@ -453,7 +454,7 @@ def main():
                 print(f"⏳ 已发送 start，等待 {POWER_WAIT}s 复查状态 ...")
                 time.sleep(POWER_WAIT)
                 state_after, raw_after = fetch_state()
-                if (raw_after or "").strip().lower() == "running":
+                if (raw_after or "").strip().lower() in ("running", "starting"):
                     boot_note = f"已启动（{state_before} → {state_after}）"
                     print(f"✅ 开机完成: {boot_note}")
                 else:
