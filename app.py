@@ -3,7 +3,9 @@ import os, sys, time, json, requests
 import urllib.parse
 
 API_KEY    = os.environ.get("API_KEY") or ""
-SERVER_ID  = os.environ.get("SERVER_ID") or ""
+SERVER_ID_RAW = (os.environ.get("SERVER_ID")
+                 or os.environ.get("SERVER_IDS") or "")
+SERVER_ID  = ""   # 当前正在处理的服务器 UUID，由 set_current_server() 设置
 COOKIE_RAW = os.environ.get("COOKIE") or ""
 EMAIL      = os.environ.get("EMAIL") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
@@ -16,10 +18,35 @@ TIMEOUT = 20
 
 MAX_RENEWAL_DAYS = 30   # 面板续期上限：续满 30 天后按钮不可点
 RENEW_INTERVAL   = int(os.environ.get("RENEW_INTERVAL") or 65)  # 两次续期间隔（面板要求 ≥1 分钟，留 5s 余量）
-MAX_RENEW_ROUNDS = 6    # 单次运行最多续期几次（安全阀；正常 3 次即可满 30 天）
+MAX_RENEW_ROUNDS = 6    # 单台服务器单次运行最多续期几次（安全阀；正常 3 次即可满 30 天）
 POWER_WAIT       = int(os.environ.get("POWER_WAIT") or 10)      # 发出 start 后首次等待秒数
 POWER_POLL_TOTAL = int(os.environ.get("POWER_POLL_TOTAL") or 120)  # 确认开机的最长轮询时间
 POWER_POLL_EVERY = int(os.environ.get("POWER_POLL_EVERY") or 10)   # 轮询间隔
+
+CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
+
+
+def parse_server_ids(raw: str):
+    """SERVER_ID 支持多台：逗号 / 分号 / 竖线 / 空格 / 换行分隔，去重且保持顺序。"""
+    if not raw:
+        return []
+    norm = raw.replace(",", "\n").replace(";", "\n").replace("|", "\n")
+    out = []
+    for item in norm.split():
+        item = item.strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+SERVER_IDS = parse_server_ids(SERVER_ID_RAW)
+
+
+def set_current_server(sid: str):
+    """所有请求函数都读全局 SERVER_ID，这里切换当前目标。"""
+    global SERVER_ID
+    SERVER_ID = sid
+
 
 def mask(s: str, head: int = 6, tail: int = 4) -> str:
     s = s or ""
@@ -80,6 +107,47 @@ def format_notification(status: str, server_name: str = "", old: str = "",
         lines.append(f"⚠️ 错误信息: {error}")
     lines.append(f"🕒 执行时间: {now}(北京时间)")
     return "\n".join(lines)
+
+def format_server_block(index: int, res: dict) -> str:
+    """多台模式下的单台报告块"""
+    tag = CIRCLED[index] if index < len(CIRCLED) else f"({index + 1})"
+    lines = [f"{tag} {res['name']}"]
+    st = res["state_before"]
+    if res["state_after"] and res["state_after"] != st:
+        st = f"{st} → {res['state_after']}"
+    if st:
+        lines.append(f"🔌 运行状态: {st}")
+    if res["old_after"]:
+        lines.append(f"⏱ 续期前到期时间: {res['old_before']}")
+        lines.append(f"⏱ 续期后到期时间: {res['old_after']}")
+    elif res["old_before"]:
+        lines.append(f"⏱ 续期前到期时间: {res['old_before']}")
+    if res["boot"]:
+        lines.append(f"▶️ 开机: {res['boot']}")
+    if res["reason"]:
+        lines.append(f"📝 原因: {res['reason']}")
+    if res["error"]:
+        lines.append(f"⚠️ 错误信息: {res['error']}")
+    return "\n".join(lines)
+
+def format_multi_notification(results) -> str:
+    """多台汇总报告：先总览再逐台"""
+    ok = sum(1 for r in results if r["rounds"] > 0 and not r["renew_failed"])
+    bad = sum(1 for r in results if r["renew_failed"])
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600))
+    if bad:
+        head = f"⚠️ 共 {len(results)} 台：续期成功 {ok} 台 / 失败 {bad} 台"
+    elif ok:
+        head = f"✅ 共 {len(results)} 台：续期成功 {ok} 台"
+    else:
+        head = f"⏭️ 共 {len(results)} 台：续期时间未到"
+    lines = ["🎰 Host-ship 续期报告", "", head,
+             f"📧 账号: {mask_email(EMAIL)}", ""]
+    for i, r in enumerate(results):
+        lines.append(format_server_block(i, r))
+        lines.append("")
+    lines.append(f"🕒 执行时间: {now}(北京时间)")
+    return "\n".join(lines).strip()
 
 def parse_cookie_str(raw: str):
     pairs = []
@@ -350,41 +418,44 @@ def fetch_state():
     state, suspended = st
     return state_text(state, suspended), state
 
-def main():
-    print("#" * 25)
-    print("   Host-ship 自动续期 + 状态巡检（纯 HTTP）")
-    print("#" * 25)
-    if not API_KEY and not COOKIE_RAW:
-        print("ℹ️ 未配置 API_KEY 且无 COOKIE，脚本终止。")
-        sys.exit(1)
-    if not SERVER_ID:
-        print("ℹ️ 未配置 SERVER_ID（服务器 UUID），脚本终止。")
-        sys.exit(1)
-    print(f"🎯 目标服务器: {mask(SERVER_ID, 8, 4)}")
-    print(f"🔑 主链 API_KEY: {'已配置' if API_KEY else '未配置'} / "
-          f"备链 COOKIE: {'已配置' if COOKIE_RAW else '未配置'}")
+def new_result(sid: str) -> dict:
+    return {"sid": sid, "name": "（未知）", "old_before": "（未获取到）",
+            "old_after": "", "state_before": "（未获取到）",
+            "state_after": "（未获取到）", "boot": "", "rounds": 0,
+            "renew_failed": False, "error": "", "reason": "",
+            "title": "⏭️ 续期时间未到"}
+
+def process_server(sid: str, index: int = 1, total: int = 1) -> dict:
+    """处理单台服务器：快照 → 循环续期 → 必要时开机。返回结果字典。"""
+    set_current_server(sid)
+    res = new_result(sid)
+    tag = f"[{index}/{total}] " if total > 1 else ""
+    print("=" * 46)
+    print(f"{tag}🎯 目标服务器: {mask(sid, 8, 4)}")
 
     name, old, gate = "（未知）", "（未获取到）", {}
     if API_KEY:
         ok, snap, err = api_get_server()
         if ok:
             name, old, gate = snap
-            print(f"📋 主链快照：{name} / {old} / {gate}")
+            print(f"{tag}📋 主链快照：{name} / {old} / {gate}")
         else:
-            print(f"⚠️ 主链 GET 失败: {err}")
+            print(f"{tag}⚠️ 主链 GET 失败: {err}")
     elif COOKIE_RAW:
         s = build_cookie_session()
         if s is not None:
             ok, snap, err = cookie_get_server(s)
             if ok:
                 name, old, gate = snap
-                print(f"📋 备链快照：{name} / {old} / {gate}")
+                print(f"{tag}📋 备链快照：{name} / {old} / {gate}")
 
     old_before = old
+    res["name"] = name
+    res["old_before"] = old_before
 
     # ---------- 1. 运行状态 ----------
     state_before, _raw_before = fetch_state()
-    print(f"🔌 运行状态: {state_before}")
+    print(f"{tag}🔌 运行状态: {state_before}")
 
     # ---------- 2. 续期（循环直到满 30 天 / 不可续 / 达安全上限）----------
     rounds = 0
@@ -399,41 +470,41 @@ def main():
             skip, reason = should_skip_renew(gate)
             if skip:
                 stop_reason = reason if rounds == 0 else f"已停止：{reason}"
-                print(("⏭️ 无需续期: " if rounds == 0 else "🛑 停止续期: ") + reason)
+                print(tag + ("⏭️ 无需续期: " if rounds == 0 else "🛑 停止续期: ") + reason)
                 break
             if rounds >= MAX_RENEW_ROUNDS:
                 stop_reason = f"已达单次运行续期上限（{MAX_RENEW_ROUNDS} 次）"
-                print(f"🛑 {stop_reason}")
+                print(f"{tag}🛑 {stop_reason}")
                 break
             if rounds > 0:
-                print(f"⏳ 等待 {RENEW_INTERVAL}s 后继续续期（面板要求间隔 ≥1 分钟）...")
+                print(f"{tag}⏳ 等待 {RENEW_INTERVAL}s 后继续续期（面板要求间隔 ≥1 分钟）...")
                 time.sleep(RENEW_INTERVAL)
             ok, info, via = renew_once()
             if not ok:
                 if is_limit_error(info):
                     stop_reason = f"续期被拒（上限/冷却）: {info[:120]}"
-                    print(f"🛑 {stop_reason}")
+                    print(f"{tag}🛑 {stop_reason}")
                 else:
                     renew_failed = True
                     renew_error = str(info)
-                    print(f"❌ 续期失败: {info}")
+                    print(f"{tag}❌ 续期失败: {info}")
                 break
             rounds += 1
-            print(f"✅ 第 {rounds} 次续期成功（{via}）")
+            print(f"{tag}✅ 第 {rounds} 次续期成功（{via}）")
             if API_KEY:
                 ok2, snap2, err2 = api_get_server()
                 if ok2:
                     name, old, gate = snap2
-                    print(f"📋 续期后快照：{name} / {old} / {gate}")
+                    print(f"{tag}📋 续期后快照：{name} / {old} / {gate}")
                 else:
-                    print(f"⚠️ 续期后 GET 失败: {err2}")
+                    print(f"{tag}⚠️ 续期后 GET 失败: {err2}")
             else:
                 s = build_cookie_session()
                 if s is not None:
                     ok2, snap2, _ = cookie_get_server(s)
                     if ok2:
                         name, old, gate = snap2
-                        print(f"📋 续期后快照：{name} / {old} / {gate}")
+                        print(f"{tag}📋 续期后快照：{name} / {old} / {gate}")
 
     # ---------- 3. 开机（停机就 start）----------
     boot_note = ""
@@ -443,7 +514,7 @@ def main():
         if raw_after is None:
             state_after, raw_after = fetch_state()
         if (raw_after or "").strip().lower() == "offline":
-            print("▶️ 检测到服务器已停机，发送 start ...")
+            print(f"{tag}▶️ 检测到服务器已停机，发送 start ...")
             ok, info = (False, "未配置 API_KEY / COOKIE")
             if API_KEY:
                 ok, info = api_power("start")
@@ -453,7 +524,7 @@ def main():
             elif COOKIE_RAW:
                 ok, info = cookie_power("start")
             if ok:
-                print(f"⏳ 已发送 start，开始轮询状态（每 {POWER_POLL_EVERY}s 一次，"
+                print(f"{tag}⏳ 已发送 start，开始轮询状态（每 {POWER_POLL_EVERY}s 一次，"
                       f"最多 {POWER_POLL_TOTAL}s）...")
                 waited = 0
                 while waited < POWER_POLL_TOTAL:
@@ -463,24 +534,24 @@ def main():
                     state_after, raw_after = fetch_state()
                     if (raw_after or "").strip().lower() in ("running", "starting"):
                         boot_note = f"已启动（{state_before} → {state_after}，{waited}s 后确认）"
-                        print(f"✅ 开机完成: {boot_note}")
+                        print(f"{tag}✅ 开机完成: {boot_note}")
                         break
                     print(f"   …已等 {waited}s：{state_after}")
                 else:
                     boot_note = (f"已发送 start（HTTP 204），但 {POWER_POLL_TOTAL}s 内面板状态仍为"
                                  f"「{state_after}」；可能是状态上报延迟，请稍后自行确认")
-                    print(f"⚠️ {boot_note}")
+                    print(f"{tag}⚠️ {boot_note}")
             else:
                 boot_note = f"开机失败: {info[:120]}"
-                print(f"❌ {boot_note}")
+                print(f"{tag}❌ {boot_note}")
         elif raw_after:
             boot_note = f"无需开机（当前{state_text(raw_after)}）"
-            print(f"ℹ️ {boot_note}")
+            print(f"{tag}ℹ️ {boot_note}")
         else:
             boot_note = "状态未知，未执行开机"
-            print(f"⚠️ {boot_note}")
+            print(f"{tag}⚠️ {boot_note}")
 
-    # ---------- 4. 通知 ----------
+    # ---------- 4. 结果 ----------
     if renew_failed:
         title = "❌ 续期失败"
     elif rounds > 0:
@@ -494,15 +565,64 @@ def main():
         reason = stop_reason
     else:
         reason = ""
-    send_telegram_message(format_notification(
-        title, server_name=name,
-        old=old_before,
-        new=old if (rounds > 0 and old != old_before) else "",
-        state=f"{state_before} → {state_after}" if state_after != state_before else state_before,
-        boot=boot_note, reason=reason, error=renew_error))
 
-    print(f"🏁 执行完毕：续期 {rounds} 次 / 状态 {state_before} → {state_after} / {boot_note}")
-    if renew_failed:
+    res.update({
+        "name": name,
+        "old_before": old_before,
+        "old_after": old if (rounds > 0 and old != old_before) else "",
+        "state_before": state_before,
+        "state_after": state_after,
+        "boot": boot_note,
+        "rounds": rounds,
+        "renew_failed": renew_failed,
+        "error": renew_error,
+        "reason": reason,
+        "title": title,
+    })
+    print(f"{tag}🏁 执行完毕：续期 {rounds} 次 / 状态 {state_before} → {state_after} / {boot_note}")
+    return res
+
+def main():
+    print("#" * 25)
+    print("   Host-ship 自动续期 + 状态巡检（纯 HTTP / 支持多台）")
+    print("#" * 25)
+    if not API_KEY and not COOKIE_RAW:
+        print("ℹ️ 未配置 API_KEY 且无 COOKIE，脚本终止。")
+        sys.exit(1)
+    if not SERVER_IDS:
+        print("ℹ️ 未配置 SERVER_ID（服务器 UUID），脚本终止。")
+        sys.exit(1)
+    print(f"🎯 共 {len(SERVER_IDS)} 台服务器: "
+          + ", ".join(mask(s, 8, 4) for s in SERVER_IDS))
+    print(f"🔑 主链 API_KEY: {'已配置' if API_KEY else '未配置'} / "
+          f"备链 COOKIE: {'已配置' if COOKIE_RAW else '未配置'}")
+
+    results = []
+    for i, sid in enumerate(SERVER_IDS):
+        try:
+            results.append(process_server(sid, i + 1, len(SERVER_IDS)))
+        except Exception as e:
+            print(f"❌ 服务器 {mask(sid, 8, 4)} 处理异常: {e}")
+            bad = new_result(sid)
+            bad.update({"renew_failed": True, "error": str(e), "title": "❌ 续期失败"})
+            results.append(bad)
+
+    # ---------- 通知：单台沿用原格式，多台用汇总格式 ----------
+    if len(results) == 1:
+        r = results[0]
+        send_telegram_message(format_notification(
+            r["title"], server_name=r["name"],
+            old=r["old_before"], new=r["old_after"],
+            state=(f"{r['state_before']} → {r['state_after']}"
+                   if r["state_after"] != r["state_before"] else r["state_before"]),
+            boot=r["boot"], reason=r["reason"], error=r["error"]))
+    else:
+        send_telegram_message(format_multi_notification(results))
+
+    failed = [r for r in results if r["renew_failed"]]
+    total_rounds = sum(r["rounds"] for r in results)
+    print(f"🏁 全部完成：{len(results)} 台 / 共续期 {total_rounds} 次 / 失败 {len(failed)} 台")
+    if failed:
         sys.exit(1)
 
 if __name__ == "__main__":
