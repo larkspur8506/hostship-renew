@@ -16,9 +16,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 TIMEOUT = 20
 
-MAX_RENEWAL_DAYS = 30   # 面板续期上限：续满 30 天后按钮不可点
+MAX_RENEWAL_DAYS = 14   # 面板续期上限（2026-10-21 实测由 30 收紧到 14；超了 POST 返 400「cannot add more than 14 days」，只能靠 POST 判，renewable 标志不再可信）
 RENEW_INTERVAL   = int(os.environ.get("RENEW_INTERVAL") or 65)  # 两次续期间隔（面板要求 ≥1 分钟，留 5s 余量）
-MAX_RENEW_ROUNDS = 6    # 单台服务器单次运行最多续期几次（安全阀；正常 3 次即可满 30 天）
+MAX_RENEW_ROUNDS = 6    # 单台服务器单次运行最多续期几次（安全阀；上限 14 天后 1~2 次即可打满）
 POWER_WAIT       = int(os.environ.get("POWER_WAIT") or 10)      # 发出 start 后首次等待秒数
 POWER_POLL_TOTAL = int(os.environ.get("POWER_POLL_TOTAL") or 120)  # 确认开机的最长轮询时间
 POWER_POLL_EVERY = int(os.environ.get("POWER_POLL_EVERY") or 10)   # 轮询间隔
@@ -211,8 +211,26 @@ def is_limit_error(info: str) -> bool:
     if contains_limit_text(info):
         return True
     low = (info or "").lower()
+    # 2026-10-21：面板把总上限收紧到 14 天，拒绝文案是
+    # "You cannot add more than 14 days of renewal time."——不含 limit/max 等旧关键词，
+    # 漏判会让「太满」被记成续期失败（退出码 1、workflow 变红）。
+    if ("cannot add more than" in low or "days of renewal" in low
+            or "renewal time" in low):
+        return True
     return any(k in low for k in ("limit", "maximum", "max", "cooldown",
                                   "locked", "renewable", "too many"))
+
+def panel_detail(info: str, limit: int = 110) -> str:
+    """把面板错误响应提炼成一句话：'HTTP 400: {"errors":[{"detail":"..."}]}' → detail。"""
+    try:
+        body = info.split(":", 1)[1].strip()
+        j = json.loads(body)
+        errs = j.get("errors") or []
+        if errs and isinstance(errs, list):
+            return str(errs[0].get("detail") or "").strip()[:limit]
+    except Exception:
+        pass
+    return (info or "")[:limit]
 
 def api_headers():
     return {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json",
@@ -482,7 +500,7 @@ def process_server(sid: str, index: int = 1, total: int = 1) -> dict:
             ok, info, via = renew_once()
             if not ok:
                 if is_limit_error(info):
-                    stop_reason = f"续期被拒（上限/冷却）: {info[:120]}"
+                    stop_reason = f"{old}，面板暂不接受加时：{panel_detail(info)}"
                     print(f"{tag}🛑 {stop_reason}")
                 else:
                     renew_failed = True
@@ -564,7 +582,8 @@ def process_server(sid: str, index: int = 1, total: int = 1) -> dict:
     elif renew_failed:
         reason = stop_reason
     else:
-        reason = ""
+        # 未续期也要把原因带上（例：剩余 20 天、面板 14 天上限 → 未到可续窗口）
+        reason = stop_reason
 
     res.update({
         "name": name,
